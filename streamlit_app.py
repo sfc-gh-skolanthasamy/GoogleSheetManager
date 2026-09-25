@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import base64
 import json
 import re
@@ -6,96 +8,126 @@ import gspread
 import pandas as pd
 import streamlit as st
 from google.oauth2.service_account import Credentials
-from snowflake.snowpark import Session
-from snowflake.snowpark.context import get_active_session
 
-st.set_page_config(
-    page_title="Google Sheets Manager",
-    page_icon="📊",
-    layout="wide",
-)
+# App host (Streamlit app lives here)
+SF_DATABASE = "MY_DATA_DB"
+SF_SCHEMA = "PUBLIC"
+SF_WAREHOUSE = "MY_WAREHOUSE"
+SF_EAI_NAME = "GOOGLE_SHEETS_ACCESS_INTEGRATION"
+SF_TIMEZONE = "America/New_York"
+TASK_NAME_PREFIX = "GSHEET_SYNC"
 
-# -- Configuration --
-# Change these values to match your Snowflake environment.
-APP_DATABASE = "MY_DATA_DB"
-APP_SCHEMA = "PUBLIC"
-APP_WAREHOUSE = "MY_WAREHOUSE"
-LOCAL_CONNECTION_NAME = "SKOLANTHASAMY"
-SECRET_NAME = "google_service_account_key"
-EAI_NAME = "google_sheets_access_integration"
-SCHEDULE_TIMEZONE = "America/Los_Angeles"
+# Operational schema — tasks, procedures, and schedules table live here
+OPS_DATABASE = "MY_DATA_DB"
+OPS_SCHEMA = "PUBLIC"
 
+# Secret location
+SF_SECRET_DATABASE = SF_DATABASE
+SF_SECRET_SCHEMA = SF_SCHEMA
+SF_SECRET_NAME = "google_service_account_key"
+SF_SECRET_SNOWFLAKE_NAME = "GOOGLE_SERVICE_ACCOUNT_KEY"
+SF_SECRET_FQN = f'{SF_SECRET_DATABASE}.{SF_SECRET_SCHEMA}.{SF_SECRET_SNOWFLAKE_NAME}'
+
+# Schedules metadata table
+SCHEDULES_TABLE = f"{OPS_DATABASE}.{OPS_SCHEMA}.GSHEET_SYNC_SCHEDULES"
+
+# Limits & cache TTLs (seconds)
+MAX_DOWNLOAD_ROWS = 10_000
+TASK_HISTORY_DAYS = 7
+TASK_HISTORY_LIMIT = 50
+CACHE_TTL_SHORT = 30
+CACHE_TTL_MEDIUM = 60
+CACHE_TTL_DEFAULT = 120
+CACHE_TTL_LONG = 300
+
+# App display
+APP_TITLE = "Google Sheets Manager"
+APP_ICON = "\U0001f4ca"
+
+# Google API scopes
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
 
-# -- Session state defaults --
+MANUAL_URL_OPTION = "\u2709\ufe0f  Paste URL manually..."
+
+# =============================================================================
+
+st.set_page_config(
+    page_title=APP_TITLE,
+    page_icon=APP_ICON,
+    layout="wide",
+)
+
 st.session_state.setdefault("selected_worksheet", None)
 st.session_state.setdefault("gcp_creds_dict", None)
 
-# Flag to detect Snowflake-hosted runtime
-_IN_SNOWFLAKE = False
-try:
-    import _snowflake
-    _IN_SNOWFLAKE = True
-except ImportError:
-    pass
-
-
 def _load_creds_from_secret() -> dict | None:
-    """Load Google service account credentials from the Snowflake secret."""
-    if not _IN_SNOWFLAKE:
-        return None
     try:
-        secret_value = _snowflake.get_generic_secret_string(SECRET_NAME)
+        import _snowflake
+        secret_value = _snowflake.get_generic_secret_string(SF_SECRET_NAME)
         try:
             decoded = base64.b64decode(secret_value).decode("utf-8")
             return json.loads(decoded)
         except Exception:
-            return json.loads(secret_value)
-    except Exception:
+            pass
+        return json.loads(secret_value)
+    except ImportError:
+        return None
+    except Exception as e:
+        st.sidebar.error(f"Secret load failed: {e}")
         return None
 
 
 # -- Google auth --
 def get_gspread_client():
-    """Authenticate with Google using service account credentials."""
     creds_dict = st.session_state.get("gcp_creds_dict")
     if not creds_dict:
         return None
+    if "private_key" in creds_dict and "\\n" in creds_dict["private_key"]:
+        creds_dict = {**creds_dict, "private_key": creds_dict["private_key"].replace("\\n", "\n")}
     creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
     return gspread.authorize(creds)
 
 
 @st.cache_resource
 def get_snowpark_session():
-    """Get a Snowpark session. Uses active session in Snowflake, falls back to local config."""
-    try:
-        return get_active_session()
-    except Exception:
-        return Session.builder.config("connection_name", LOCAL_CONNECTION_NAME).create()
+    from snowflake.snowpark.context import get_active_session
+    return get_active_session()
 
 
 # -- Data loading --
 
-
-@st.cache_data(ttl=120)
+@st.cache_data(ttl=CACHE_TTL_DEFAULT)
 def extract_spreadsheet_id(url: str) -> str | None:
-    """Extract the spreadsheet ID from a Google Sheets URL or raw ID."""
     match = re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]+)", url)
     if match:
         return match.group(1)
-    # Allow pasting a raw spreadsheet ID (no slashes, alphanumeric + _-)
     stripped = url.strip()
     if stripped and "/" not in stripped and re.fullmatch(r"[a-zA-Z0-9_-]+", stripped):
         return stripped
     return None
 
 
-@st.cache_data(ttl=120)
+@st.cache_data(ttl=CACHE_TTL_LONG)
+def list_available_sheets() -> list[dict]:
+    """List all Google Sheets accessible by the service account."""
+    client = get_gspread_client()
+    if not client:
+        return []
+    try:
+        all_sheets = client.openall()
+        return [
+            {"title": s.title, "id": s.id, "url": s.url}
+            for s in sorted(all_sheets, key=lambda s: s.title.lower())
+        ]
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=CACHE_TTL_DEFAULT)
 def get_spreadsheet_info(spreadsheet_id: str) -> dict:
-    """Get spreadsheet title and worksheet names by ID."""
     client = get_gspread_client()
     spreadsheet = client.open_by_key(spreadsheet_id)
     return {
@@ -105,16 +137,14 @@ def get_spreadsheet_info(spreadsheet_id: str) -> dict:
     }
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=CACHE_TTL_MEDIUM)
 def load_worksheet(spreadsheet_id: str, worksheet_name: str) -> pd.DataFrame:
-    """Load a worksheet into a DataFrame."""
     client = get_gspread_client()
     spreadsheet = client.open_by_key(spreadsheet_id)
     worksheet = spreadsheet.worksheet(worksheet_name)
     try:
         records = worksheet.get_all_records()
     except IndexError:
-        # Happens when the sheet has data but no proper header row or has merged cells
         values = worksheet.get_all_values()
         if not values or len(values) < 2:
             return pd.DataFrame()
@@ -125,15 +155,13 @@ def load_worksheet(spreadsheet_id: str, worksheet_name: str) -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=CACHE_TTL_LONG)
 def get_table_columns(table_name: str) -> list[dict]:
-    """Get column names and types for a Snowflake table."""
     session = get_snowpark_session()
     result = session.sql(f"DESCRIBE TABLE IDENTIFIER('{table_name}')").collect()
     columns = []
     for row in result:
         row_dict = row.as_dict() if hasattr(row, "as_dict") else dict(row)
-        # Handle both uppercase and lowercase keys
         name = row_dict.get("name") or row_dict.get("NAME")
         col_type = row_dict.get("type") or row_dict.get("TYPE")
         if name:
@@ -143,7 +171,6 @@ def get_table_columns(table_name: str) -> list[dict]:
 
 def upload_to_snowflake(df: pd.DataFrame, table_name: str, column_mapping: dict,
                         database: str, schema: str):
-    """Upload a DataFrame to an existing Snowflake table with column mapping."""
     session = get_snowpark_session()
     mapped_df = df.rename(columns=column_mapping)
     target_cols = list(column_mapping.values())
@@ -158,17 +185,37 @@ def upload_to_snowflake(df: pd.DataFrame, table_name: str, column_mapping: dict,
     )
 
 
-MAX_DOWNLOAD_ROWS = 10_000
+def _infer_snowflake_type(series: pd.Series) -> str:
+    if series.dropna().empty:
+        return "VARCHAR"
+    if pd.api.types.is_integer_dtype(series):
+        return "NUMBER"
+    if pd.api.types.is_float_dtype(series):
+        return "FLOAT"
+    if pd.api.types.is_bool_dtype(series):
+        return "BOOLEAN"
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return "TIMESTAMP"
+    return "VARCHAR"
+
+
+def create_table_from_df(df: pd.DataFrame, table_name: str, database: str, schema: str):
+    session = get_snowpark_session()
+    col_defs = []
+    for col in df.columns:
+        safe_col = col.upper().replace(" ", "_")
+        safe_col = re.sub(r"[^A-Z0-9_]", "", safe_col)
+        if not safe_col:
+            safe_col = f"COL_{df.columns.tolist().index(col)}"
+        sf_type = _infer_snowflake_type(df[col])
+        col_defs.append(f'"{safe_col}" {sf_type}')
+    cols_sql = ", ".join(col_defs)
+    fqn = f"{database}.{schema}.{table_name}"
+    session.sql(f"CREATE TABLE {fqn} ({cols_sql})").collect()
 
 
 def read_snowflake_table(fqn: str, limit: int = MAX_DOWNLOAD_ROWS,
                          where_clause: str = "") -> pd.DataFrame:
-    """Read rows from a Snowflake table into a DataFrame (capped at `limit` rows).
-
-    If *where_clause* is provided it is appended as a filter.  The clause is
-    passed through ``DataFrame.filter()`` which safely parameterises the
-    expression via Snowpark.
-    """
     session = get_snowpark_session()
     df = session.table(fqn)
     if where_clause:
@@ -176,25 +223,22 @@ def read_snowflake_table(fqn: str, limit: int = MAX_DOWNLOAD_ROWS,
     return df.limit(limit).to_pandas()
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=CACHE_TTL_LONG)
 def list_databases() -> list[str]:
-    """List all databases the current role can see."""
     session = get_snowpark_session()
     result = session.sql("SHOW DATABASES").collect()
     return [row["name"] for row in result]
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=CACHE_TTL_LONG)
 def list_schemas(database: str) -> list[str]:
-    """List schemas in a database."""
     session = get_snowpark_session()
     result = session.sql(f"SHOW SCHEMAS IN DATABASE IDENTIFIER('{database}')").collect()
     return [row["name"] for row in result]
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=CACHE_TTL_LONG)
 def list_tables_in(database: str, schema: str) -> list[str]:
-    """List tables in a specific database.schema."""
     session = get_snowpark_session()
     result = session.sql(
         f"SHOW TABLES IN SCHEMA IDENTIFIER('{database}.{schema}')"
@@ -203,7 +247,6 @@ def list_tables_in(database: str, schema: str) -> list[str]:
 
 
 def write_to_worksheet(spreadsheet_id: str, worksheet_name: str, df: pd.DataFrame, create_new: bool):
-    """Write a DataFrame to a worksheet (existing or newly created)."""
     client = get_gspread_client()
     spreadsheet = client.open_by_key(spreadsheet_id)
     if create_new:
@@ -222,12 +265,6 @@ def write_to_worksheet(spreadsheet_id: str, worksheet_name: str, df: pd.DataFram
 def create_new_spreadsheet(title: str, worksheet_name: str, df: pd.DataFrame,
                            share_with_email: str | None = None,
                            folder_id: str | None = None) -> dict:
-    """Create a brand-new Google Spreadsheet and write a DataFrame to its first sheet.
-
-    If folder_id is provided, the spreadsheet is created inside that Google Drive
-    folder (the service account must have Editor access to it).
-    If share_with_email is provided, the spreadsheet is shared with that user.
-    """
     client = get_gspread_client()
     spreadsheet = client.create(title, folder_id=folder_id)
     worksheet = spreadsheet.sheet1
@@ -242,46 +279,38 @@ def create_new_spreadsheet(title: str, worksheet_name: str, df: pd.DataFrame,
 
 # -- Schedule helpers --
 
-SCHEDULES_TABLE = f"{APP_DATABASE}.{APP_SCHEMA}.GSHEET_SYNC_SCHEDULES"
-
-
 def _sanitize_for_proc_body(value: str) -> str:
-    """Sanitize a string value for embedding inside a $$ procedure body.
-
-    Prevents $$ escape and backslash injection by rejecting dangerous patterns.
-    """
     if "$$" in value:
         raise ValueError(f"Value must not contain '$$': {value!r}")
-    # Escape backslashes and double-quotes so the string stays safe inside Python quotes
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def create_sync_procedure(task_name: str, fqn: str, spreadsheet_id: str, worksheet_name: str):
-    """Create a Python stored procedure that syncs a Snowflake table to a Google Sheet."""
+def create_sync_procedure(task_name: str, fqn: str, spreadsheet_id: str,
+                          worksheet_name: str, where_clause: str = "",
+                          row_limit: int = MAX_DOWNLOAD_ROWS):
     safe_task = _validate_identifier(task_name)
-    # fqn is DB.SCHEMA.TABLE -- validate each part
     fqn_parts = fqn.split(".")
     if len(fqn_parts) != 3 or not all(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", p) for p in fqn_parts):
         raise ValueError(f"Invalid fully-qualified table name: {fqn!r}")
     safe_fqn = ".".join(fqn_parts)
     safe_ss_id = _sanitize_for_proc_body(spreadsheet_id)
     safe_ws_name = _sanitize_for_proc_body(worksheet_name)
+    safe_where = _sanitize_for_proc_body(where_clause) if where_clause else ""
+    safe_limit = int(row_limit)
+    where_clause_encoded = str([ord(c) for c in safe_where])
 
     session = get_snowpark_session()
-    fq_prefix = f"{APP_DATABASE}.{APP_SCHEMA}"
-    fq_secret = f"{fq_prefix}.{SECRET_NAME}"
     proc_sql = f"""
-CREATE OR REPLACE PROCEDURE {fq_prefix}.{safe_task}_PROC()
+CREATE OR REPLACE PROCEDURE {OPS_DATABASE}.{OPS_SCHEMA}.{safe_task}_PROC()
 RETURNS STRING
 LANGUAGE PYTHON
 RUNTIME_VERSION = '3.11'
-PACKAGES = ('snowflake-snowpark-python', 'gspread', 'google-auth')
+PACKAGES = ("snowflake-snowpark-python", "gspread", "google-auth")
 HANDLER = 'run'
-EXTERNAL_ACCESS_INTEGRATIONS = ({EAI_NAME})
-SECRETS = ('{SECRET_NAME}' = {fq_secret})
+EXTERNAL_ACCESS_INTEGRATIONS = ({SF_EAI_NAME})
+SECRETS = ('{SF_SECRET_NAME}' = {SF_SECRET_FQN})
 AS
 $$
-import base64
 import json
 import _snowflake
 import gspread
@@ -291,19 +320,19 @@ from snowflake.snowpark.context import get_active_session
 def run(session=None):
     if session is None:
         session = get_active_session()
-    secret_value = _snowflake.get_generic_secret_string("{SECRET_NAME}")
-    try:
-        decoded = base64.b64decode(secret_value).decode("utf-8")
-        creds_dict = json.loads(decoded)
-    except Exception:
-        creds_dict = json.loads(secret_value)
+    secret_value = _snowflake.get_generic_secret_string("{SF_SECRET_NAME}")
+    creds_dict = json.loads(secret_value)
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
     creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
     gc = gspread.authorize(creds)
-    df = session.table("{safe_fqn}").to_pandas()
+    df = session.table("{safe_fqn}")
+    where_clause = chr(0)[:0].join(chr(c) for c in {where_clause_encoded})
+    if where_clause:
+        df = df.filter(where_clause)
+    df = df.limit({safe_limit}).to_pandas()
     spreadsheet = gc.open_by_key("{safe_ss_id}")
     try:
         worksheet = spreadsheet.worksheet("{safe_ws_name}")
@@ -323,66 +352,69 @@ $$
 
 
 def create_sync_task(task_name: str, cron_expr: str):
-    """Create and resume a Snowflake task that calls the sync procedure."""
     safe_task = _validate_identifier(task_name)
-    # Validate cron expression: only allow digits, spaces, *, /, -, comma
     if not re.fullmatch(r"[0-9 */,\-]+", cron_expr):
         raise ValueError(f"Invalid CRON expression: {cron_expr!r}")
     session = get_snowpark_session()
-    fq_prefix = f"{APP_DATABASE}.{APP_SCHEMA}"
     session.sql(f"""
-CREATE OR REPLACE TASK {fq_prefix}.{safe_task}
-    WAREHOUSE = {APP_WAREHOUSE}
-    SCHEDULE = 'USING CRON {cron_expr} {SCHEDULE_TIMEZONE}'
+CREATE OR REPLACE TASK {OPS_DATABASE}.{OPS_SCHEMA}.{safe_task}
+    WAREHOUSE = {SF_WAREHOUSE}
+    SCHEDULE = 'USING CRON {cron_expr} {SF_TIMEZONE}'
 AS
-    CALL {fq_prefix}.{safe_task}_PROC()
+    CALL {OPS_DATABASE}.{OPS_SCHEMA}.{safe_task}_PROC()
 """).collect()
-    session.sql(f"ALTER TASK {fq_prefix}.{safe_task} RESUME").collect()
+    session.sql(f"ALTER TASK {OPS_DATABASE}.{OPS_SCHEMA}.{safe_task} RESUME").collect()
 
 
 def insert_schedule_record(task_name, src_db, src_schema, src_table,
-                           spreadsheet_id, spreadsheet_name, worksheet_name, cron_expr):
-    """Insert a row into the schedules metadata table."""
+                           spreadsheet_id, spreadsheet_name, worksheet_name, cron_expr,
+                           where_clause: str = "", row_limit: int = MAX_DOWNLOAD_ROWS):
     session = get_snowpark_session()
+    for col_def in [
+        "WHERE_CLAUSE VARCHAR DEFAULT ''",
+        f"ROW_LIMIT NUMBER DEFAULT {MAX_DOWNLOAD_ROWS}",
+    ]:
+        try:
+            session.sql(f"ALTER TABLE {SCHEDULES_TABLE} ADD COLUMN {col_def}").collect()
+        except Exception:
+            pass
     session.sql(
         f"INSERT INTO {SCHEDULES_TABLE}"
         " (TASK_NAME, SOURCE_DATABASE, SOURCE_SCHEMA, SOURCE_TABLE,"
-        "  SPREADSHEET_ID, SPREADSHEET_NAME, WORKSHEET_NAME, CRON_EXPRESSION)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "  SPREADSHEET_ID, SPREADSHEET_NAME, WORKSHEET_NAME, CRON_EXPRESSION,"
+        "  WHERE_CLAUSE, ROW_LIMIT)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         params=[task_name, src_db, src_schema, src_table,
-                spreadsheet_id, spreadsheet_name, worksheet_name, cron_expr],
+                spreadsheet_id, spreadsheet_name, worksheet_name, cron_expr,
+                where_clause, row_limit],
     ).collect()
 
 
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=CACHE_TTL_SHORT)
 def list_schedules() -> pd.DataFrame:
-    """Read all schedule records."""
     session = get_snowpark_session()
     return session.table(SCHEDULES_TABLE).to_pandas()
 
 
 def _validate_identifier(name: str) -> str:
-    """Validate that a string is a safe Snowflake identifier (alphanumeric + underscores)."""
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
         raise ValueError(f"Invalid identifier: {name!r}")
     return name
 
 
 def delete_schedule(task_name: str, schedule_id: int):
-    """Drop the task, procedure, and metadata row."""
     safe_name = _validate_identifier(task_name)
     session = get_snowpark_session()
-    fq_prefix = f"{APP_DATABASE}.{APP_SCHEMA}"
     try:
-        session.sql(f"ALTER TASK {fq_prefix}.{safe_name} SUSPEND").collect()
+        session.sql(f"ALTER TASK {OPS_DATABASE}.{OPS_SCHEMA}.{safe_name} SUSPEND").collect()
     except Exception:
         pass
     try:
-        session.sql(f"DROP TASK IF EXISTS {fq_prefix}.{safe_name}").collect()
+        session.sql(f"DROP TASK IF EXISTS {OPS_DATABASE}.{OPS_SCHEMA}.{safe_name}").collect()
     except Exception:
         pass
     try:
-        session.sql(f"DROP PROCEDURE IF EXISTS {fq_prefix}.{safe_name}_PROC()").collect()
+        session.sql(f"DROP PROCEDURE IF EXISTS {OPS_DATABASE}.{OPS_SCHEMA}.{safe_name}_PROC()").collect()
     except Exception:
         pass
     session.sql(
@@ -392,15 +424,14 @@ def delete_schedule(task_name: str, schedule_id: int):
 
 
 def get_task_history(task_name: str) -> pd.DataFrame:
-    """Get recent execution history for a task."""
     safe_name = _validate_identifier(task_name)
     session = get_snowpark_session()
     result = session.sql(f"""
 SELECT SCHEDULED_TIME, QUERY_START_TIME, COMPLETED_TIME, STATE, ERROR_MESSAGE, RETURN_VALUE
-FROM TABLE({APP_DATABASE}.INFORMATION_SCHEMA.TASK_HISTORY(
+FROM TABLE({OPS_DATABASE}.INFORMATION_SCHEMA.TASK_HISTORY(
     TASK_NAME => '{safe_name}',
-    SCHEDULED_TIME_RANGE_START => DATEADD('day', -7, CURRENT_TIMESTAMP()),
-    RESULT_LIMIT => 50
+    SCHEDULED_TIME_RANGE_START => DATEADD('day', -{TASK_HISTORY_DAYS}, CURRENT_TIMESTAMP()),
+    RESULT_LIMIT => {TASK_HISTORY_LIMIT}
 ))
 ORDER BY SCHEDULED_TIME DESC
 """).collect()
@@ -410,7 +441,7 @@ ORDER BY SCHEDULED_TIME DESC
 
 
 # -- UI --
-st.title("Google Sheets Manager")
+st.title(APP_TITLE)
 
 # Sidebar: connection status and configuration
 with st.sidebar:
@@ -424,22 +455,20 @@ with st.sidebar:
     except Exception as e:
         st.error(f"Snowflake connection failed: {e}")
         st.caption(
-            f"If running locally, check that the {LOCAL_CONNECTION_NAME} connection is configured "
-            "in ~/.snowflake/connections.toml."
+            "If running locally, check that a [connections.snowflake] section is configured "
+            "in .streamlit/secrets.toml."
         )
         st.stop()
 
     st.divider()
     st.header("Google Drive")
 
-    # Try loading credentials from Snowflake secret first
     if st.session_state.get("gcp_creds_dict") is None:
         secret_creds = _load_creds_from_secret()
         if secret_creds:
             st.session_state["gcp_creds_dict"] = secret_creds
 
-    # If not in Snowflake (no secret available), allow pasting JSON manually
-    if not _IN_SNOWFLAKE and st.session_state.get("gcp_creds_dict") is None:
+    if st.session_state.get("gcp_creds_dict") is None:
         json_text = st.text_area(
             "Paste service account JSON",
             height=150,
@@ -460,7 +489,6 @@ with st.sidebar:
 
     try:
         client = get_gspread_client()
-        # Verify the client works by checking it's not None
         if client is None:
             raise ValueError("Failed to create gspread client")
         st.success("Connected to Google")
@@ -470,16 +498,44 @@ with st.sidebar:
         st.stop()
 
     st.divider()
-    sheet_url = st.text_input(
-        "Google Sheet URL",
-        placeholder="https://docs.google.com/spreadsheets/d/.../edit",
-        key="sheet_url_input",
-    )
+
+    # ---- Google Sheet selection: dropdown of available sheets ----
+    with st.spinner("Loading available Google Sheets..."):
+        available_sheets = list_available_sheets()
+
+    if available_sheets:
+        sheet_options = [f"{s['title']}" for s in available_sheets]
+        sheet_options.append(MANUAL_URL_OPTION)
+
+        selected_option = st.selectbox(
+            "Select a Google Sheet",
+            sheet_options,
+            key="sheet_selector",
+        )
+
+        if selected_option == MANUAL_URL_OPTION:
+            sheet_url = st.text_input(
+                "Google Sheet URL",
+                placeholder="https://docs.google.com/spreadsheets/d/.../edit",
+                key="sheet_url_input",
+            )
+        else:
+            idx = sheet_options.index(selected_option)
+            chosen = available_sheets[idx]
+            sheet_url = chosen["url"]
+            st.caption(f"ID: `{chosen['id']}`")
+    else:
+        st.warning("No sheets found for this service account. Paste a URL instead.")
+        sheet_url = st.text_input(
+            "Google Sheet URL",
+            placeholder="https://docs.google.com/spreadsheets/d/.../edit",
+            key="sheet_url_input",
+        )
 
     if not sheet_url:
         st.info(
-            "Paste a Google Sheet URL above to get started. "
-            f"Make sure the sheet is shared with **{sa_email}** (Editor access)."
+            "Select a Google Sheet above to get started. "
+            f"Make sure sheets are shared with **{sa_email}** (Editor access)."
         )
         st.stop()
 
@@ -564,115 +620,131 @@ with tab_upload:
                 tables = []
                 upload_ok = False
 
-        if upload_ok and not tables:
-            st.warning(
-                f"No tables found in {up_database}.{up_schema}. "
-                "Create a table first, then upload data to it."
-            )
-            upload_ok = False
-
         if upload_ok:
-            target_table = st.selectbox("Table", tables, key="up_table")
-            up_fqn = f"{up_database}.{up_schema}.{target_table}"
+            CREATE_NEW_OPTION = "-- Create new table --"
+            table_options = [CREATE_NEW_OPTION] + tables
+            target_table = st.selectbox("Table", table_options, key="up_table")
 
-            try:
-                table_cols = get_table_columns(up_fqn)
-            except Exception as e:
-                st.error(f"Failed to describe table: {e}")
-                table_cols = []
-            sf_col_names = [c["name"] for c in table_cols]
-            sheet_col_names = df.columns.tolist()
+            creating_new_table = (target_table == CREATE_NEW_OPTION)
 
-            if not sf_col_names:
-                st.warning("Could not retrieve columns for this table.")
-                upload_ok = False
+            if creating_new_table:
+                new_table_name = st.text_input(
+                    "New table name",
+                    placeholder="e.g. MY_NEW_TABLE",
+                    key="up_new_table_name",
+                ).strip().upper()
 
-        if upload_ok:
-            st.subheader("Column mapping")
-            st.caption("Map each sheet column to a Snowflake table column.")
+                if new_table_name and not re.fullmatch(r"[A-Z_][A-Z0-9_]*", new_table_name):
+                    st.error("Invalid table name. Use letters, numbers, and underscores only (must start with a letter or underscore).")
+                    upload_ok = False
 
-            column_mapping = {}
-            cols = st.columns(2)
-            cols[0].markdown("**Sheet column**")
-            cols[1].markdown("**Snowflake column**")
+                if upload_ok and new_table_name:
+                    up_fqn = f"{up_database}.{up_schema}.{new_table_name}"
 
-            for sheet_col in sheet_col_names:
-                col_left, col_right = st.columns(2)
-                col_left.text(sheet_col)
+                    st.subheader("Inferred column definitions")
+                    st.caption("Columns will be created based on the sheet data. All columns default to VARCHAR unless numeric/date types are detected.")
 
-                default_idx = 0
-                sheet_col_upper = sheet_col.upper()
-                for i, sf_col in enumerate(sf_col_names):
-                    if sf_col.upper() == sheet_col_upper:
-                        default_idx = i
-                        break
+                    col_info = []
+                    for col in df.columns:
+                        safe_col = col.upper().replace(" ", "_")
+                        safe_col = re.sub(r"[^A-Z0-9_]", "", safe_col)
+                        if not safe_col:
+                            safe_col = f"COL_{df.columns.tolist().index(col)}"
+                        sf_type = _infer_snowflake_type(df[col])
+                        col_info.append({"Sheet Column": col, "Snowflake Column": safe_col, "Type": sf_type})
 
-                mapped_col = col_right.selectbox(
-                    f"Map '{sheet_col}'",
-                    sf_col_names,
-                    index=default_idx,
-                    key=f"map_{sheet_col}",
-                    label_visibility="collapsed",
-                )
-                column_mapping[sheet_col] = mapped_col
+                    st.dataframe(pd.DataFrame(col_info), use_container_width=True)
 
-            mapped_targets = list(column_mapping.values())
-            duplicates = [c for c in set(mapped_targets) if mapped_targets.count(c) > 1]
+                    if st.button("Create Table & Upload", type="primary"):
+                        with st.spinner(f"Creating table {up_fqn} and uploading {len(df)} rows..."):
+                            try:
+                                create_table_from_df(df, new_table_name, up_database, up_schema)
+                                col_mapping = {}
+                                for col in df.columns:
+                                    safe_col = col.upper().replace(" ", "_")
+                                    safe_col = re.sub(r"[^A-Z0-9_]", "", safe_col)
+                                    if not safe_col:
+                                        safe_col = f"COL_{df.columns.tolist().index(col)}"
+                                    col_mapping[col] = safe_col
+                                upload_to_snowflake(df, new_table_name, col_mapping,
+                                                    up_database, up_schema)
+                                st.success(
+                                    f"Created table and uploaded {len(df)} rows to **{up_fqn}**."
+                                )
+                            except Exception as e:
+                                st.error(f"Upload failed: {e}")
+            else:
+                up_fqn = f"{up_database}.{up_schema}.{target_table}"
+                st.subheader("Column mapping")
 
-            if duplicates:
-                st.warning(
-                    f"Multiple sheet columns map to the same Snowflake column: "
-                    f"{', '.join(duplicates)}. Fix the mapping before uploading."
-                )
+                try:
+                    sf_columns = get_table_columns(up_fqn)
+                except Exception as e:
+                    st.error(f"Failed to get table columns: {e}")
+                    sf_columns = []
+                    upload_ok = False
 
-            if st.button(
-                "Upload to Snowflake",
-                type="primary",
-                disabled=len(duplicates) > 0,
-            ):
-                with st.spinner(f"Uploading {len(df)} rows to {up_fqn}..."):
-                    try:
-                        upload_to_snowflake(df, target_table, column_mapping,
-                                            up_database, up_schema)
-                        st.success(
-                            f"Successfully uploaded {len(df)} rows to **{up_fqn}**."
+                if upload_ok and sf_columns:
+                    sf_col_names = [c["name"] for c in sf_columns]
+                    column_mapping = {}
+                    for sheet_col in df.columns:
+                        best_match_idx = 0
+                        clean_sheet = sheet_col.upper().replace(" ", "_")
+                        clean_sheet = re.sub(r"[^A-Z0-9_]", "", clean_sheet)
+                        for i, sf_name in enumerate(sf_col_names):
+                            if sf_name.upper() == clean_sheet:
+                                best_match_idx = i
+                                break
+                        mapped = st.selectbox(
+                            f"**{sheet_col}** maps to",
+                            sf_col_names,
+                            index=best_match_idx,
+                            key=f"map_{sheet_col}",
                         )
-                    except Exception as e:
-                        st.error(f"Upload failed: {e}")
+                        column_mapping[sheet_col] = mapped
+
+                    if st.button("Upload to Snowflake", type="primary"):
+                        with st.spinner(f"Uploading {len(df)} rows to **{up_fqn}**..."):
+                            try:
+                                upload_to_snowflake(df, target_table, column_mapping,
+                                                    up_database, up_schema)
+                                st.success(f"Uploaded {len(df)} rows to **{up_fqn}**.")
+                            except Exception as e:
+                                st.error(f"Upload failed: {e}")
 
 
 # -- DOWNLOAD TO GOOGLE SHEET TAB --
 with tab_download:
-    st.subheader("Source Snowflake table")
+    st.subheader("Download Snowflake table to Google Sheet")
 
     dl_ok = True
     try:
-        databases = list_databases()
+        dl_databases = list_databases()
     except Exception as e:
         st.error(f"Failed to list databases: {e}")
-        databases = []
+        dl_databases = []
         dl_ok = False
 
-    if dl_ok and not databases:
+    if dl_ok and not dl_databases:
         st.warning("No databases found.")
         dl_ok = False
 
     if dl_ok:
-        dl_database = st.selectbox("Database", databases, key="dl_database")
+        dl_database = st.selectbox("Database", dl_databases, key="dl_database")
 
         try:
-            schemas = list_schemas(dl_database)
+            dl_schemas = list_schemas(dl_database)
         except Exception as e:
             st.error(f"Failed to list schemas: {e}")
-            schemas = []
+            dl_schemas = []
             dl_ok = False
 
-    if dl_ok and not schemas:
+    if dl_ok and not dl_schemas:
         st.warning(f"No schemas found in {dl_database}.")
         dl_ok = False
 
     if dl_ok:
-        dl_schema = st.selectbox("Schema", schemas, key="dl_schema")
+        dl_schema = st.selectbox("Schema", dl_schemas, key="dl_schema")
 
         try:
             dl_tables = list_tables_in(dl_database, dl_schema)
@@ -686,8 +758,8 @@ with tab_download:
         dl_ok = False
 
     if dl_ok:
-        source_table = st.selectbox("Table", dl_tables, key="dl_source_table")
-        fqn = f"{dl_database}.{dl_schema}.{source_table}"
+        dl_table = st.selectbox("Table", dl_tables, key="dl_table")
+        dl_fqn = f"{dl_database}.{dl_schema}.{dl_table}"
 
         dl_row_limit = st.number_input(
             "Max rows to download",
@@ -701,131 +773,87 @@ with tab_download:
 
         dl_where = st.text_input(
             "WHERE clause (optional)",
-            placeholder='e.g. STATUS = \'ACTIVE\' AND CREATED_AT > \'2024-01-01\'',
+            placeholder="e.g. STATUS = 'ACTIVE' AND CREATED_AT > '2024-01-01'",
             key="dl_where_clause",
             help="Filter rows before downloading. Enter a SQL boolean expression (without the WHERE keyword).",
         )
 
-        if st.button("Preview table data"):
-            st.session_state["dl_preview"] = True
+        st.subheader("Target worksheet")
 
-        if st.session_state.get("dl_preview"):
-            with st.spinner(f"Reading {fqn}..."):
-                try:
-                    sf_df = read_snowflake_table(fqn, limit=dl_row_limit, where_clause=dl_where)
-                except Exception as e:
-                    st.error(f"Failed to read table: {e}")
-                    sf_df = None
-
-            if sf_df is not None:
-                row_note = f" (capped at {dl_row_limit:,})" if len(sf_df) >= dl_row_limit else ""
-                st.caption(f"{len(sf_df):,} rows{row_note}, {len(sf_df.columns)} columns")
-                st.dataframe(sf_df.head(10), use_container_width=True)
-
-        st.subheader("Target Google Sheet")
-
-        dl_target = st.radio(
-            "Destination",
-            ["Existing spreadsheet", "New spreadsheet"],
-            key="dl_target_type",
+        target_ws_option = st.radio(
+            "Write to",
+            ["Existing worksheet", "New worksheet", "New spreadsheet"],
+            key="dl_ws_option",
         )
 
-        if dl_target == "New spreadsheet":
-            st.caption(
-                "Create a Google Drive folder, share it with the service account "
-                f"(**{sa_email}**) as Editor, then paste the folder ID below. "
-                "The folder ID is the last part of the folder URL: "
-                "`https://drive.google.com/drive/folders/<FOLDER_ID>`"
+        if target_ws_option == "New worksheet":
+            target_ws_name = st.text_input(
+                "New worksheet name",
+                value=dl_table,
+                key="dl_new_ws",
             )
-            dl_folder_id = st.text_input(
-                "Google Drive folder ID",
-                placeholder="e.g. 1aBcDeFgHiJkLmNoPqRsTuVwXyZ",
-                key="dl_folder_id",
-            )
+            target_create_new = True
+            target_new_ss = False
+        elif target_ws_option == "New spreadsheet":
             new_ss_title = st.text_input(
-                "New spreadsheet name",
-                value=source_table,
+                "New spreadsheet title",
+                value=f"{dl_table} export",
                 key="dl_new_ss_title",
             )
-            new_ss_ws_name = st.text_input(
+            target_ws_name = st.text_input(
                 "Worksheet name",
-                value="Sheet1",
-                key="dl_new_ss_ws_name",
+                value=dl_table,
+                key="dl_new_ss_ws",
             )
-            share_email = st.text_input(
-                "Share with (your Google email)",
-                placeholder="you@example.com",
-                key="dl_share_email",
-                help="Optional. The spreadsheet will also be shared directly with this email.",
+            target_create_new = True
+            target_new_ss = True
+        else:
+            target_ws_name = st.selectbox(
+                "Select worksheet",
+                ss_info["worksheets"],
+                key="dl_existing_ws",
             )
+            target_create_new = False
+            target_new_ss = False
 
-            if st.button("Download to new Google Sheet", type="primary"):
-                if not dl_folder_id:
-                    st.warning("Enter a Google Drive folder ID to create the spreadsheet in.")
-                else:
-                    with st.spinner(f"Reading {fqn} and creating new spreadsheet..."):
-                        try:
-                            sf_df = read_snowflake_table(fqn, limit=dl_row_limit, where_clause=dl_where)
+        if st.button("Download & Write", type="primary"):
+            with st.spinner(f"Reading up to {dl_row_limit:,} rows from **{dl_fqn}**..."):
+                try:
+                    dl_df = read_snowflake_table(dl_fqn, limit=dl_row_limit,
+                                                 where_clause=dl_where)
+                except Exception as e:
+                    st.error(f"Failed to read table: {e}")
+                    dl_df = pd.DataFrame()
+
+            if not dl_df.empty:
+                with st.spinner("Writing to Google Sheets..."):
+                    try:
+                        if target_new_ss:
                             result = create_new_spreadsheet(
-                                new_ss_title, new_ss_ws_name, sf_df,
-                                share_with_email=share_email or None,
-                                folder_id=dl_folder_id,
+                                new_ss_title, target_ws_name, dl_df,
+                                share_with_email=None,
                             )
                             st.success(
-                                f"Created spreadsheet **{new_ss_title}** with "
-                                f"{len(sf_df):,} rows in worksheet **{new_ss_ws_name}**."
+                                f"Created new spreadsheet with {len(dl_df)} rows. "
+                                f"[Open in Google Sheets]({result['url']})"
                             )
-                            st.caption(f"Spreadsheet URL: {result['url']}")
-                        except Exception as e:
-                            st.error(f"Download failed: {e}")
-
-        else:
-            st.caption(f"Spreadsheet: **{ss_info['name']}**")
-
-            ws_option = st.radio(
-                "Write to",
-                ["Existing worksheet (overwrites data)", "New worksheet"],
-                key="dl_ws_option",
-            )
-
-            if ws_option == "New worksheet":
-                new_ws_name = st.text_input(
-                    "New worksheet name",
-                    value=source_table,
-                    key="dl_new_ws_name",
-                )
-                target_ws_name = new_ws_name
-                create_new = True
-            else:
-                target_ws_name = st.selectbox(
-                    "Select worksheet",
-                    ss_info["worksheets"],
-                    key="dl_existing_ws",
-                )
-                create_new = False
-
-            if st.button("Download to Google Sheet", type="primary"):
-                with st.spinner(f"Reading {fqn} and writing to '{target_ws_name}'..."):
-                    try:
-                        sf_df = read_snowflake_table(fqn, limit=dl_row_limit, where_clause=dl_where)
-                        write_to_worksheet(ss_id, target_ws_name, sf_df, create_new)
-                        st.success(
-                            f"Successfully wrote {len(sf_df):,} rows to "
-                            f"worksheet **{target_ws_name}** in **{ss_info['name']}**."
-                        )
+                        else:
+                            write_to_worksheet(ss_id, target_ws_name, dl_df, target_create_new)
+                            st.success(
+                                f"Wrote {len(dl_df)} rows to **{ss_info['name']} / {target_ws_name}**."
+                            )
                     except Exception as e:
-                        st.error(f"Download failed: {e}")
+                        st.error(f"Failed to write to Google Sheets: {e}")
+            elif dl_df.empty:
+                st.info("No data found matching the criteria.")
 
 
 # -- SCHEDULE SYNC TAB --
 with tab_schedule:
     st.subheader("Create a scheduled sync")
-    st.caption("Periodically export a Snowflake table to a Google Sheet worksheet.")
+    st.caption("Automatically sync a Snowflake table to a Google Sheet on a recurring schedule.")
 
     sched_ok = True
-
-    # -- Source table selection --
-    st.markdown("**Source Snowflake table**")
     try:
         sched_databases = list_databases()
     except Exception as e:
@@ -867,6 +895,23 @@ with tab_schedule:
 
     if sched_ok:
         sched_table = st.selectbox("Table", sched_tables, key="sched_table")
+
+        sched_row_limit = st.number_input(
+            "Max rows to sync",
+            min_value=1,
+            max_value=MAX_DOWNLOAD_ROWS,
+            value=MAX_DOWNLOAD_ROWS,
+            step=1000,
+            key="sched_row_limit",
+            help=f"Maximum allowed: {MAX_DOWNLOAD_ROWS:,} rows",
+        )
+
+        sched_where = st.text_input(
+            "WHERE clause (optional)",
+            placeholder="e.g. STATUS = 'ACTIVE' AND CREATED_AT > '2024-01-01'",
+            key="sched_where_clause",
+            help="Filter rows before syncing. Enter a SQL boolean expression (without the WHERE keyword).",
+        )
 
         # -- Target Google Sheet selection --
         st.markdown("**Target Google Sheet**")
@@ -938,15 +983,17 @@ with tab_schedule:
         # -- Create button --
         can_create = bool(sched_cron and sched_ws_name)
         if st.button("Create Schedule", type="primary", disabled=not can_create):
-            task_name = f"GSHEET_SYNC_{sched_db}_{sched_schema}_{sched_table}".upper()
+            task_name = f"{TASK_NAME_PREFIX}_{sched_db}_{sched_schema}_{sched_table}".upper()
             fqn = f"{sched_db}.{sched_schema}.{sched_table}"
             with st.spinner("Creating stored procedure, task, and schedule..."):
                 try:
-                    create_sync_procedure(task_name, fqn, sched_ss_id, sched_ws_name)
+                    create_sync_procedure(task_name, fqn, sched_ss_id, sched_ws_name,
+                                          where_clause=sched_where, row_limit=sched_row_limit)
                     create_sync_task(task_name, sched_cron)
                     insert_schedule_record(
                         task_name, sched_db, sched_schema, sched_table,
                         sched_ss_id, sched_ss_name, sched_ws_name, sched_cron,
+                        where_clause=sched_where, row_limit=sched_row_limit,
                     )
                     st.success(
                         f"Schedule created. Task **{task_name}** will sync "
@@ -966,9 +1013,12 @@ with tab_schedule:
     if schedules_df.empty:
         st.info("No schedules created yet.")
     else:
+        sched_display_cols = ["TASK_NAME", "SOURCE_TABLE", "SPREADSHEET_NAME",
+                              "WORKSHEET_NAME", "CRON_EXPRESSION", "STATUS", "CREATED_AT",
+                              "WHERE_CLAUSE", "ROW_LIMIT"]
+        sched_display_cols = [c for c in sched_display_cols if c in schedules_df.columns]
         st.dataframe(
-            schedules_df[["TASK_NAME", "SOURCE_TABLE", "SPREADSHEET_NAME",
-                          "WORKSHEET_NAME", "CRON_EXPRESSION", "STATUS", "CREATED_AT"]],
+            schedules_df[sched_display_cols],
             use_container_width=True,
         )
 
@@ -1031,12 +1081,11 @@ with tab_monitor:
                     "The task will run on its next scheduled time."
                 )
             else:
-                # Show summary counts
                 col1, col2, col3 = st.columns(3)
                 total_runs = len(history_df)
                 succeeded = len(history_df[history_df["STATE"] == "SUCCEEDED"])
                 failed = len(history_df[history_df["STATE"] == "FAILED"])
-                col1.metric("Total runs (last 7 days)", total_runs)
+                col1.metric(f"Total runs (last {TASK_HISTORY_DAYS} days)", total_runs)
                 col2.metric("Succeeded", succeeded)
                 col3.metric("Failed", failed)
 
